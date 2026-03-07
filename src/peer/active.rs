@@ -6,7 +6,7 @@
 use crate::bloom::BloomFilter;
 use crate::mmp::{MmpConfig, MmpPeerState};
 use crate::utils::index::SessionIndex;
-use crate::noise::NoiseSession;
+use crate::noise::{HandshakeState as NoiseHandshakeState, NoiseError, NoiseSession};
 use crate::transport::{LinkId, LinkStats, TransportAddr, TransportId};
 use crate::tree::{ParentDeclaration, TreeCoordinate};
 use crate::{FipsAddress, NodeAddr, PeerIdentity};
@@ -147,6 +147,38 @@ pub struct ActivePeer {
     // === Replay Detection Suppression ===
     /// Number of replay detections suppressed since last session reset.
     replay_suppressed_count: u32,
+    /// Consecutive decryption failures (reset on any successful decrypt).
+    consecutive_decrypt_failures: u32,
+
+    // === Rekey (Key Rotation) ===
+    /// When the current Noise session was established (for rekey timer).
+    session_established_at: Instant,
+    /// Current K-bit epoch value (alternates each rekey).
+    current_k_bit: bool,
+    /// Previous session kept alive during drain window after cutover.
+    previous_session: Option<NoiseSession>,
+    /// Previous session's our_index (for peers_by_index cleanup on drain expiry).
+    previous_our_index: Option<SessionIndex>,
+    /// When the drain window started (None = no drain in progress).
+    drain_started: Option<Instant>,
+    /// Pending new session from completed rekey (before K-bit cutover).
+    pending_new_session: Option<NoiseSession>,
+    /// Pending new session's our_index.
+    pending_our_index: Option<SessionIndex>,
+    /// Pending new session's their_index.
+    pending_their_index: Option<SessionIndex>,
+    /// Whether a rekey is currently in progress (handshake sent, not yet complete).
+    rekey_in_progress: bool,
+    /// When we last received a rekey msg1 from this peer (dampening).
+    last_peer_rekey: Option<Instant>,
+    /// In-progress rekey: Noise handshake state (initiator only).
+    rekey_handshake: Option<NoiseHandshakeState>,
+    /// In-progress rekey: our new session index.
+    rekey_our_index: Option<SessionIndex>,
+    /// In-progress rekey: wire-format msg1 for resend.
+    rekey_msg1: Option<Vec<u8>>,
+    /// In-progress rekey: next resend timestamp (Unix ms).
+    rekey_msg1_next_resend: u64,
 }
 
 impl ActivePeer {
@@ -155,6 +187,7 @@ impl ActivePeer {
     /// Called after successful authentication handshake.
     /// For peers with Noise sessions, use `with_session` instead.
     pub fn new(identity: PeerIdentity, link_id: LinkId, authenticated_at: u64) -> Self {
+        let now = Instant::now();
         Self {
             identity,
             link_id,
@@ -173,7 +206,7 @@ impl ActivePeer {
             filter_sequence: 0,
             filter_received_at: 0,
             pending_filter_update: true, // Send filter on new connection
-            session_start: Instant::now(),
+            session_start: now,
             link_stats: LinkStats::new(),
             authenticated_at,
             last_seen: authenticated_at,
@@ -182,6 +215,21 @@ impl ActivePeer {
             last_heartbeat_sent: None,
             handshake_msg2: None,
             replay_suppressed_count: 0,
+            consecutive_decrypt_failures: 0,
+            session_established_at: now,
+            current_k_bit: false,
+            previous_session: None,
+            previous_our_index: None,
+            drain_started: None,
+            pending_new_session: None,
+            pending_our_index: None,
+            pending_their_index: None,
+            rekey_in_progress: false,
+            last_peer_rekey: None,
+            rekey_handshake: None,
+            rekey_our_index: None,
+            rekey_msg1: None,
+            rekey_msg1_next_resend: 0,
         }
     }
 
@@ -219,6 +267,7 @@ impl ActivePeer {
         mmp_config: &MmpConfig,
         remote_epoch: Option<[u8; 8]>,
     ) -> Self {
+        let now = Instant::now();
         Self {
             identity,
             link_id,
@@ -237,7 +286,7 @@ impl ActivePeer {
             filter_sequence: 0,
             filter_received_at: 0,
             pending_filter_update: true,
-            session_start: Instant::now(),
+            session_start: now,
             link_stats,
             authenticated_at,
             last_seen: authenticated_at,
@@ -246,6 +295,21 @@ impl ActivePeer {
             last_heartbeat_sent: None,
             handshake_msg2: None,
             replay_suppressed_count: 0,
+            consecutive_decrypt_failures: 0,
+            session_established_at: now,
+            current_k_bit: false,
+            previous_session: None,
+            previous_our_index: None,
+            drain_started: None,
+            pending_new_session: None,
+            pending_our_index: None,
+            pending_their_index: None,
+            rekey_in_progress: false,
+            last_peer_rekey: None,
+            rekey_handshake: None,
+            rekey_our_index: None,
+            rekey_msg1: None,
+            rekey_msg1_next_resend: 0,
         }
     }
 
@@ -413,6 +477,19 @@ impl ActivePeer {
     /// Current replay suppression count.
     pub fn replay_suppressed_count(&self) -> u32 {
         self.replay_suppressed_count
+    }
+
+    // === Decryption Failure Tracking ===
+
+    /// Increment consecutive decryption failure counter, returning new count.
+    pub fn increment_decrypt_failures(&mut self) -> u32 {
+        self.consecutive_decrypt_failures += 1;
+        self.consecutive_decrypt_failures
+    }
+
+    /// Reset consecutive decryption failure counter.
+    pub fn reset_decrypt_failures(&mut self) {
+        self.consecutive_decrypt_failures = 0;
     }
 
     // === Epoch Accessors ===
@@ -688,6 +765,258 @@ impl ActivePeer {
     /// Clear the pending filter update flag.
     pub fn clear_filter_update_needed(&mut self) {
         self.pending_filter_update = false;
+    }
+
+    // === Rekey (Key Rotation) ===
+
+    /// When the current Noise session was established.
+    pub fn session_established_at(&self) -> Instant {
+        self.session_established_at
+    }
+
+    /// Current K-bit epoch value.
+    pub fn current_k_bit(&self) -> bool {
+        self.current_k_bit
+    }
+
+    /// Whether a rekey is currently in progress.
+    pub fn rekey_in_progress(&self) -> bool {
+        self.rekey_in_progress
+    }
+
+    /// Mark that a rekey has been initiated.
+    pub fn set_rekey_in_progress(&mut self) {
+        self.rekey_in_progress = true;
+    }
+
+    /// Check if rekey initiation is dampened (peer recently sent us msg1).
+    pub fn is_rekey_dampened(&self, dampening_secs: u64) -> bool {
+        match self.last_peer_rekey {
+            Some(t) => t.elapsed().as_secs() < dampening_secs,
+            None => false,
+        }
+    }
+
+    /// Record that the peer initiated a rekey (for dampening).
+    pub fn record_peer_rekey(&mut self) {
+        self.last_peer_rekey = Some(Instant::now());
+    }
+
+    /// Get the pending new session's our_index.
+    pub fn pending_our_index(&self) -> Option<SessionIndex> {
+        self.pending_our_index
+    }
+
+    /// Get the pending new session's their_index.
+    pub fn pending_their_index(&self) -> Option<SessionIndex> {
+        self.pending_their_index
+    }
+
+    /// Get the previous session's our_index (during drain).
+    pub fn previous_our_index(&self) -> Option<SessionIndex> {
+        self.previous_our_index
+    }
+
+    /// Get the previous session for decryption fallback.
+    pub fn previous_session(&self) -> Option<&NoiseSession> {
+        self.previous_session.as_ref()
+    }
+
+    /// Get mutable access to the previous session for decryption.
+    pub fn previous_session_mut(&mut self) -> Option<&mut NoiseSession> {
+        self.previous_session.as_mut()
+    }
+
+    /// Get the pending new session (completed rekey, not yet cut over).
+    pub fn pending_new_session(&self) -> Option<&NoiseSession> {
+        self.pending_new_session.as_ref()
+    }
+
+    /// Store a completed rekey session and its indices.
+    ///
+    /// Called when the rekey handshake completes. The session is held
+    /// as pending until the initiator flips the K-bit on the next outbound packet.
+    pub fn set_pending_session(
+        &mut self,
+        session: NoiseSession,
+        our_index: SessionIndex,
+        their_index: SessionIndex,
+    ) {
+        self.pending_new_session = Some(session);
+        self.pending_our_index = Some(our_index);
+        self.pending_their_index = Some(their_index);
+        self.rekey_in_progress = false;
+        // Clear initiator handshake state (index now lives in pending_our_index)
+        self.rekey_our_index = None;
+        self.rekey_handshake = None;
+        self.rekey_msg1 = None;
+        self.rekey_msg1_next_resend = 0;
+    }
+
+    /// Cut over to the pending new session (initiator side).
+    ///
+    /// Moves current session to previous (for drain), promotes pending to current,
+    /// flips the K-bit. Returns the old our_index that should remain in peers_by_index
+    /// during the drain window.
+    pub fn cutover_to_new_session(&mut self) -> Option<SessionIndex> {
+        let new_session = self.pending_new_session.take()?;
+        let new_our_index = self.pending_our_index.take();
+        let new_their_index = self.pending_their_index.take();
+
+        // Demote current to previous
+        self.previous_session = self.noise_session.take();
+        self.previous_our_index = self.our_index;
+        self.drain_started = Some(Instant::now());
+
+        // Promote pending to current
+        self.noise_session = Some(new_session);
+        self.our_index = new_our_index;
+        self.their_index = new_their_index;
+
+        // Flip K-bit and reset timing
+        self.current_k_bit = !self.current_k_bit;
+        self.session_established_at = Instant::now();
+        self.session_start = Instant::now();
+        self.rekey_in_progress = false;
+        self.reset_replay_suppressed();
+
+        self.previous_our_index
+    }
+
+    /// Handle receiving a K-bit flip from the peer (responder side).
+    ///
+    /// Promotes pending_new_session to current, demotes current to previous.
+    /// Returns the old our_index for drain tracking.
+    pub fn handle_peer_kbit_flip(&mut self) -> Option<SessionIndex> {
+        let new_session = self.pending_new_session.take()?;
+        let new_our_index = self.pending_our_index.take();
+        let new_their_index = self.pending_their_index.take();
+
+        // Demote current to previous
+        self.previous_session = self.noise_session.take();
+        self.previous_our_index = self.our_index;
+        self.drain_started = Some(Instant::now());
+
+        // Promote pending to current
+        self.noise_session = Some(new_session);
+        self.our_index = new_our_index;
+        self.their_index = new_their_index;
+
+        // Match peer's K-bit
+        self.current_k_bit = !self.current_k_bit;
+        self.session_established_at = Instant::now();
+        self.session_start = Instant::now();
+        self.rekey_in_progress = false;
+        self.reset_replay_suppressed();
+
+        self.previous_our_index
+    }
+
+    /// Check if the drain window has expired.
+    pub fn drain_expired(&self, drain_secs: u64) -> bool {
+        match self.drain_started {
+            Some(t) => t.elapsed().as_secs() >= drain_secs,
+            None => false,
+        }
+    }
+
+    /// Whether a drain is in progress.
+    pub fn is_draining(&self) -> bool {
+        self.drain_started.is_some()
+    }
+
+    /// Complete the drain: drop previous session and free its index.
+    ///
+    /// Returns the previous our_index so the caller can remove it from
+    /// peers_by_index and free it from the IndexAllocator.
+    pub fn complete_drain(&mut self) -> Option<SessionIndex> {
+        self.previous_session = None;
+        self.drain_started = None;
+        self.previous_our_index.take()
+    }
+
+    /// Abandon an in-progress rekey.
+    ///
+    /// Returns the rekey our_index so the caller can free it.
+    /// Also clears any pending session state if the handshake was completed
+    /// but not yet cut over.
+    pub fn abandon_rekey(&mut self) -> Option<SessionIndex> {
+        self.rekey_handshake = None;
+        self.rekey_msg1 = None;
+        self.rekey_msg1_next_resend = 0;
+        self.rekey_in_progress = false;
+        // Return whichever index needs freeing
+        self.rekey_our_index.take()
+            .or_else(|| {
+                self.pending_new_session = None;
+                self.pending_their_index = None;
+                self.pending_our_index.take()
+            })
+    }
+
+    // === Rekey Handshake State (Initiator) ===
+
+    /// Store rekey handshake state after sending msg1.
+    pub fn set_rekey_state(
+        &mut self,
+        handshake: NoiseHandshakeState,
+        our_index: SessionIndex,
+        wire_msg1: Vec<u8>,
+        next_resend_ms: u64,
+    ) {
+        self.rekey_handshake = Some(handshake);
+        self.rekey_our_index = Some(our_index);
+        self.rekey_msg1 = Some(wire_msg1);
+        self.rekey_msg1_next_resend = next_resend_ms;
+        self.rekey_in_progress = true;
+    }
+
+    /// Get the rekey our_index (for msg2 dispatch lookup).
+    pub fn rekey_our_index(&self) -> Option<SessionIndex> {
+        self.rekey_our_index
+    }
+
+    /// Complete the rekey by processing msg2 (initiator side).
+    ///
+    /// Takes the stored handshake state, reads msg2, and returns the
+    /// completed NoiseSession. Clears the handshake-related fields but
+    /// leaves rekey_our_index for set_pending_session to use.
+    pub fn complete_rekey_msg2(
+        &mut self,
+        msg2_bytes: &[u8],
+    ) -> Result<NoiseSession, NoiseError> {
+        let mut hs = self.rekey_handshake
+            .take()
+            .ok_or_else(|| NoiseError::WrongState {
+                expected: "rekey handshake in progress".to_string(),
+                got: "no handshake state".to_string(),
+            })?;
+
+        hs.read_message_2(msg2_bytes)?;
+        let session = hs.into_session()?;
+
+        // Clear msg1 resend state
+        self.rekey_msg1 = None;
+        self.rekey_msg1_next_resend = 0;
+
+        Ok(session)
+    }
+
+    /// Check if msg1 needs resending.
+    pub fn needs_msg1_resend(&self, now_ms: u64) -> bool {
+        self.rekey_in_progress
+            && self.rekey_msg1.is_some()
+            && now_ms >= self.rekey_msg1_next_resend
+    }
+
+    /// Get msg1 bytes for resend (without consuming).
+    pub fn rekey_msg1(&self) -> Option<&[u8]> {
+        self.rekey_msg1.as_deref()
+    }
+
+    /// Update next resend timestamp.
+    pub fn set_msg1_next_resend(&mut self, next_ms: u64) {
+        self.rekey_msg1_next_resend = next_ms;
     }
 }
 

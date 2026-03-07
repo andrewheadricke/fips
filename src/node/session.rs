@@ -91,6 +91,22 @@ pub(crate) struct SessionEntry {
     resend_count: u32,
     /// When the next resend should fire (Unix ms). 0 = no resend scheduled.
     next_resend_at_ms: u64,
+
+    // === Rekey (Key Rotation) ===
+    /// Current K-bit epoch value (alternates each rekey).
+    current_k_bit: bool,
+    /// Previous NoiseSession during drain window after cutover.
+    previous_noise_session: Option<NoiseSession>,
+    /// When drain window started (Unix ms). 0 = no drain.
+    drain_started_ms: u64,
+    /// In-progress rekey state (runs alongside Established session).
+    rekey_state: Option<HandshakeState>,
+    /// Pending completed session awaiting K-bit cutover.
+    pending_new_session: Option<NoiseSession>,
+    /// Whether we initiated the current rekey.
+    rekey_initiator: bool,
+    /// Dampening: last time peer sent us a rekey msg1 (Unix ms).
+    last_peer_rekey_ms: u64,
 }
 
 impl SessionEntry {
@@ -119,6 +135,13 @@ impl SessionEntry {
             handshake_payload: None,
             resend_count: 0,
             next_resend_at_ms: 0,
+            current_k_bit: false,
+            previous_noise_session: None,
+            drain_started_ms: 0,
+            rekey_state: None,
+            pending_new_session: None,
+            rekey_initiator: false,
+            last_peer_rekey_ms: 0,
         }
     }
 
@@ -291,5 +314,145 @@ impl SessionEntry {
     pub(crate) fn record_resend(&mut self, next_resend_at_ms: u64) {
         self.resend_count += 1;
         self.next_resend_at_ms = next_resend_at_ms;
+    }
+
+    // === Rekey (Key Rotation) ===
+
+    /// Current K-bit epoch value.
+    pub(crate) fn current_k_bit(&self) -> bool {
+        self.current_k_bit
+    }
+
+    /// Whether a rekey is currently in progress.
+    pub(crate) fn has_rekey_in_progress(&self) -> bool {
+        self.rekey_state.is_some()
+    }
+
+    /// Get the pending new session (completed rekey, not yet cut over).
+    pub(crate) fn pending_new_session(&self) -> Option<&NoiseSession> {
+        self.pending_new_session.as_ref()
+    }
+
+    /// Get the previous session for decryption fallback during drain.
+    pub(crate) fn previous_noise_session_mut(&mut self) -> Option<&mut NoiseSession> {
+        self.previous_noise_session.as_mut()
+    }
+
+    /// Whether we initiated the current rekey.
+    pub(crate) fn is_rekey_initiator(&self) -> bool {
+        self.rekey_initiator
+    }
+
+    /// Check if rekey initiation is dampened.
+    pub(crate) fn is_rekey_dampened(&self, now_ms: u64, dampening_ms: u64) -> bool {
+        if self.last_peer_rekey_ms == 0 {
+            return false;
+        }
+        now_ms.saturating_sub(self.last_peer_rekey_ms) < dampening_ms
+    }
+
+    /// Record that the peer initiated a rekey (for dampening).
+    pub(crate) fn record_peer_rekey(&mut self, now_ms: u64) {
+        self.last_peer_rekey_ms = now_ms;
+    }
+
+    /// When the session transitioned to Established (for rekey timer).
+    pub(crate) fn session_start_ms(&self) -> u64 {
+        self.session_start_ms
+    }
+
+    /// Get the current send counter from the established NoiseSession.
+    pub(crate) fn send_counter(&self) -> u64 {
+        match self.state.as_ref() {
+            Some(EndToEndState::Established(s)) => s.current_send_counter(),
+            _ => 0,
+        }
+    }
+
+    /// Store a completed rekey session.
+    pub(crate) fn set_pending_session(&mut self, session: NoiseSession) {
+        self.pending_new_session = Some(session);
+        self.rekey_state = None;
+    }
+
+    /// Set the rekey handshake state (in-progress XK handshake).
+    pub(crate) fn set_rekey_state(&mut self, state: HandshakeState, is_initiator: bool) {
+        self.rekey_state = Some(state);
+        self.rekey_initiator = is_initiator;
+    }
+
+    /// Take the rekey state for processing.
+    pub(crate) fn take_rekey_state(&mut self) -> Option<HandshakeState> {
+        self.rekey_state.take()
+    }
+
+    /// Cut over to the pending new session (initiator side).
+    ///
+    /// Moves current session to previous (for drain), promotes pending to current,
+    /// flips the K-bit.
+    pub(crate) fn cutover_to_new_session(&mut self, now_ms: u64) -> bool {
+        let new_session = match self.pending_new_session.take() {
+            Some(s) => s,
+            None => return false,
+        };
+
+        // Demote current to previous for drain
+        if let Some(EndToEndState::Established(old)) = self.state.take() {
+            self.previous_noise_session = Some(old);
+        }
+        self.drain_started_ms = now_ms;
+
+        // Promote pending to current
+        self.state = Some(EndToEndState::Established(new_session));
+        self.current_k_bit = !self.current_k_bit;
+        self.session_start_ms = now_ms;
+        self.rekey_state = None;
+        self.rekey_initiator = false;
+        true
+    }
+
+    /// Handle receiving a K-bit flip from the peer (responder side).
+    pub(crate) fn handle_peer_kbit_flip(&mut self, now_ms: u64) -> bool {
+        let new_session = match self.pending_new_session.take() {
+            Some(s) => s,
+            None => return false,
+        };
+
+        // Demote current to previous for drain
+        if let Some(EndToEndState::Established(old)) = self.state.take() {
+            self.previous_noise_session = Some(old);
+        }
+        self.drain_started_ms = now_ms;
+
+        // Promote pending to current
+        self.state = Some(EndToEndState::Established(new_session));
+        self.current_k_bit = !self.current_k_bit;
+        self.session_start_ms = now_ms;
+        self.rekey_state = None;
+        self.rekey_initiator = false;
+        true
+    }
+
+    /// Check if the drain window has expired.
+    pub(crate) fn drain_expired(&self, now_ms: u64, drain_ms: u64) -> bool {
+        self.drain_started_ms > 0 && now_ms.saturating_sub(self.drain_started_ms) >= drain_ms
+    }
+
+    /// Whether a drain is in progress.
+    pub(crate) fn is_draining(&self) -> bool {
+        self.drain_started_ms > 0
+    }
+
+    /// Complete the drain: drop previous session.
+    pub(crate) fn complete_drain(&mut self) {
+        self.previous_noise_session = None;
+        self.drain_started_ms = 0;
+    }
+
+    /// Abandon an in-progress rekey.
+    pub(crate) fn abandon_rekey(&mut self) {
+        self.rekey_state = None;
+        self.pending_new_session = None;
+        self.rekey_initiator = false;
     }
 }

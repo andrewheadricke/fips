@@ -108,6 +108,7 @@ impl Node {
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
                     self.resend_pending_handshakes(now_ms).await;
+                    self.resend_pending_rekeys(now_ms).await;
                     self.resend_pending_session_handshakes(now_ms).await;
                     self.purge_idle_sessions(now_ms);
                     self.process_pending_retries(now_ms).await;
@@ -116,6 +117,8 @@ impl Node {
                     self.check_mmp_reports().await;
                     self.check_session_mmp_reports().await;
                     self.check_link_heartbeats().await;
+                    self.check_rekey().await;
+                    self.check_session_rekey().await;
                     self.purge_stale_lookups(now_ms);
                     self.poll_transport_discovery().await;
                     self.sample_transport_congestion();

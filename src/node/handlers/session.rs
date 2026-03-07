@@ -9,8 +9,8 @@ use crate::node::session::{EndToEndState, SessionEntry};
 use crate::node::session_wire::{
     build_fsp_header, fsp_prepend_inner_header, fsp_strip_inner_header,
     parse_encrypted_coords, FspCommonPrefix, FspEncryptedHeader, FSP_COMMON_PREFIX_SIZE,
-    FSP_FLAG_CP, FSP_HEADER_SIZE, FSP_PHASE_ESTABLISHED, FSP_PHASE_MSG1, FSP_PHASE_MSG2,
-    FSP_PHASE_MSG3,
+    FSP_FLAG_CP, FSP_FLAG_K, FSP_HEADER_SIZE, FSP_PHASE_ESTABLISHED, FSP_PHASE_MSG1,
+    FSP_PHASE_MSG2, FSP_PHASE_MSG3,
 };
 use crate::protocol::{coords_wire_size, encode_coords};
 use crate::upper::icmp::FIPS_OVERHEAD;
@@ -162,6 +162,25 @@ impl Node {
             }
         }
 
+        // K-bit flip detection: peer has cut over to the new session.
+        let received_k_bit = header.flags & FSP_FLAG_K != 0;
+        {
+            let entry = self.sessions.get(src_addr).unwrap();
+            let k_bit_flipped = received_k_bit != entry.current_k_bit()
+                && entry.pending_new_session().is_some();
+
+            if k_bit_flipped {
+                let display_name = self.peer_display_name(src_addr);
+                info!(
+                    peer = %display_name,
+                    "Peer FSP K-bit flip detected, promoting new session"
+                );
+                let now_ms = Self::now_ms();
+                let entry = self.sessions.get_mut(src_addr).unwrap();
+                entry.handle_peer_kbit_flip(now_ms);
+            }
+        }
+
         let mut entry = match self.sessions.remove(src_addr) {
             Some(e) => e,
             None => return,
@@ -184,12 +203,31 @@ impl Node {
         ) {
             Ok(pt) => pt,
             Err(e) => {
-                debug!(
-                    error = %e, src = %self.peer_display_name(src_addr), counter = header.counter,
-                    "Session AEAD decryption failed"
-                );
-                self.sessions.insert(*src_addr, entry);
-                return;
+                // Current session failed — try previous session (drain window)
+                if let Some(prev_session) = entry.previous_noise_session_mut() {
+                    match prev_session.decrypt_with_replay_check_and_aad(
+                        ciphertext,
+                        header.counter,
+                        &header.header_bytes,
+                    ) {
+                        Ok(pt) => pt,
+                        Err(_) => {
+                            debug!(
+                                error = %e, src = %self.peer_display_name(src_addr), counter = header.counter,
+                                "Session AEAD decryption failed (current and previous)"
+                            );
+                            self.sessions.insert(*src_addr, entry);
+                            return;
+                        }
+                    }
+                } else {
+                    debug!(
+                        error = %e, src = %self.peer_display_name(src_addr), counter = header.counter,
+                        "Session AEAD decryption failed"
+                    );
+                    self.sessions.insert(*src_addr, entry);
+                    return;
+                }
             }
         };
 
@@ -338,6 +376,53 @@ impl Node {
                 }
                 return;
             } else if existing.is_established() {
+                // Rekey: if rekey enabled, treat as rekey for key rotation.
+                // The existing established session remains active for traffic.
+                if self.config.node.rekey.enabled && !existing.has_rekey_in_progress() {
+                    let our_keypair = self.identity.keypair();
+                    let mut handshake = HandshakeState::new_xk_responder(our_keypair);
+                    handshake.set_local_epoch(self.startup_epoch);
+
+                    if let Err(e) = handshake.read_xk_message_1(&setup.handshake_payload) {
+                        debug!(error = %e, "Failed to process rekey XK msg1");
+                        return;
+                    }
+
+                    // Generate msg2
+                    let msg2 = match handshake.write_xk_message_2() {
+                        Ok(m) => m,
+                        Err(e) => {
+                            debug!(error = %e, "Failed to generate rekey XK msg2");
+                            return;
+                        }
+                    };
+
+                    // Build and send SessionAck
+                    let our_coords = self.tree_state.my_coords().clone();
+                    let ack = SessionAck::new(our_coords, setup.src_coords).with_handshake(msg2);
+                    let ack_payload = ack.encode();
+                    let my_addr = *self.node_addr();
+                    let mut datagram = SessionDatagram::new(my_addr, *src_addr, ack_payload)
+                        .with_ttl(self.config.node.session.default_ttl);
+
+                    if let Err(e) = self.send_session_datagram(&mut datagram).await {
+                        debug!(error = %e, dest = %self.peer_display_name(src_addr), "Failed to send rekey SessionAck");
+                        return;
+                    }
+
+                    // Store rekey state on the existing entry
+                    let now_ms = Self::now_ms();
+                    let entry = self.sessions.get_mut(src_addr).unwrap();
+                    entry.set_rekey_state(handshake, false);
+                    entry.record_peer_rekey(now_ms);
+
+                    debug!(
+                        src = %self.peer_display_name(src_addr),
+                        "FSP rekey: processed peer's msg1, sent msg2, awaiting msg3"
+                    );
+                    return;
+                }
+
                 // Re-establishment: replace existing session below
                 debug!(src = %self.peer_display_name(src_addr), "Session re-establishment from peer");
             }
@@ -422,6 +507,70 @@ impl Node {
                 return;
             }
         };
+
+        // Rekey path: entry is Established with rekey_state
+        if entry.is_established() && entry.has_rekey_in_progress() && entry.is_rekey_initiator() {
+            let mut handshake = match entry.take_rekey_state() {
+                Some(hs) => hs,
+                None => {
+                    self.sessions.insert(*src_addr, entry);
+                    return;
+                }
+            };
+
+            // Process XK msg2
+            if let Err(e) = handshake.read_xk_message_2(&ack.handshake_payload) {
+                debug!(error = %e, "Failed to process rekey XK msg2");
+                entry.abandon_rekey();
+                self.sessions.insert(*src_addr, entry);
+                return;
+            }
+
+            // Generate XK msg3
+            let msg3 = match handshake.write_xk_message_3() {
+                Ok(m) => m,
+                Err(e) => {
+                    debug!(error = %e, "Failed to generate rekey XK msg3");
+                    entry.abandon_rekey();
+                    self.sessions.insert(*src_addr, entry);
+                    return;
+                }
+            };
+
+            // Send SessionMsg3
+            let msg3_wire = SessionMsg3::new(msg3);
+            let msg3_payload = msg3_wire.encode();
+            let my_addr = *self.node_addr();
+            let mut datagram = SessionDatagram::new(my_addr, *src_addr, msg3_payload)
+                .with_ttl(self.config.node.session.default_ttl);
+
+            if let Err(e) = self.send_session_datagram(&mut datagram).await {
+                debug!(error = %e, dest = %self.peer_display_name(src_addr), "Failed to send rekey SessionMsg3");
+                entry.abandon_rekey();
+                self.sessions.insert(*src_addr, entry);
+                return;
+            }
+
+            // Complete handshake → store as pending new session
+            let session = match handshake.into_session() {
+                Ok(s) => s,
+                Err(e) => {
+                    debug!(error = %e, "Failed to create session from rekey XK");
+                    entry.abandon_rekey();
+                    self.sessions.insert(*src_addr, entry);
+                    return;
+                }
+            };
+
+            entry.set_pending_session(session);
+            self.sessions.insert(*src_addr, entry);
+
+            debug!(
+                src = %self.peer_display_name(src_addr),
+                "FSP rekey: completed XK as initiator, pending cutover"
+            );
+            return;
+        }
 
         // Must be in Initiating state — check before take to avoid poisoning
         if !entry.is_initiating() {
@@ -517,6 +666,45 @@ impl Node {
                 return;
             }
         };
+
+        // Rekey path: entry is Established with rekey_state (responder side)
+        if entry.is_established() && entry.has_rekey_in_progress() && !entry.is_rekey_initiator() {
+            let mut handshake = match entry.take_rekey_state() {
+                Some(hs) => hs,
+                None => {
+                    self.sessions.insert(*src_addr, entry);
+                    return;
+                }
+            };
+
+            // Process XK msg3
+            if let Err(e) = handshake.read_xk_message_3(&msg3.handshake_payload) {
+                debug!(error = %e, "Failed to process rekey XK msg3");
+                entry.abandon_rekey();
+                self.sessions.insert(*src_addr, entry);
+                return;
+            }
+
+            // Complete the handshake → store as pending new session
+            let session = match handshake.into_session() {
+                Ok(s) => s,
+                Err(e) => {
+                    debug!(error = %e, "Failed to create session from rekey XK msg3");
+                    entry.abandon_rekey();
+                    self.sessions.insert(*src_addr, entry);
+                    return;
+                }
+            };
+
+            entry.set_pending_session(session);
+            self.sessions.insert(*src_addr, entry);
+
+            debug!(
+                src = %self.peer_display_name(src_addr),
+                "FSP rekey: completed XK as responder, pending cutover"
+            );
+            return;
+        }
 
         // Must be in AwaitingMsg3 state
         if !entry.is_awaiting_msg3() {
@@ -985,8 +1173,13 @@ impl Node {
             entry.set_coords_warmup_remaining(entry.coords_warmup_remaining() - 1);
         }
 
-        // Build FSP flags (CP flag only if coords will be piggybacked)
-        let flags = if include_coords { FSP_FLAG_CP } else { 0 };
+        // Build FSP flags (CP flag if coords, K-bit for key epoch)
+        let mut flags = if include_coords { FSP_FLAG_CP } else { 0 };
+        if let Some(entry) = self.sessions.get(dest_addr)
+            && entry.current_k_bit()
+        {
+            flags |= FSP_FLAG_K;
+        }
 
         // Borrow session for counter + encryption (after potential standalone send)
         let entry = self.sessions.get_mut(dest_addr).ok_or_else(|| NodeError::SendFailed {
@@ -1074,6 +1267,10 @@ impl Node {
             node_addr: *dest_addr,
             reason: "no session".into(),
         })?;
+
+        // Read K-bit before mutable borrow of session state
+        let k_flags = if entry.current_k_bit() { FSP_FLAG_K } else { 0 };
+
         let session = match entry.state_mut() {
             EndToEndState::Established(s) => s,
             _ => {
@@ -1089,9 +1286,9 @@ impl Node {
         // FSP inner header + plaintext
         let inner_plaintext = fsp_prepend_inner_header(timestamp, msg_type, inner_flags, payload);
 
-        // Build 12-byte FSP header (no flags — no CP for reports)
+        // Build 12-byte FSP header (K-bit for key epoch, no CP for reports)
         let payload_len = inner_plaintext.len() as u16;
-        let header = build_fsp_header(counter, 0, payload_len);
+        let header = build_fsp_header(counter, k_flags, payload_len);
 
         // Encrypt with AAD
         let ciphertext = session.encrypt_with_aad(&inner_plaintext, &header).map_err(|e| {
@@ -1255,7 +1452,7 @@ impl Node {
     /// Returns our own coordinates as a fallback (the SessionSetup will
     /// carry src_coords for return path routing; empty dest_coords
     /// would fail wire encoding since TreeCoordinate requires ≥1 entry).
-    fn get_dest_coords(&self, dest: &NodeAddr) -> crate::tree::TreeCoordinate {
+    pub(in crate::node) fn get_dest_coords(&self, dest: &NodeAddr) -> crate::tree::TreeCoordinate {
         let now_ms = Self::now_ms();
         if let Some(coords) = self.coord_cache.get(dest, now_ms) {
             return coords.clone();

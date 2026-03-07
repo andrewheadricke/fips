@@ -117,11 +117,27 @@ impl Node {
         }
 
         let link_id = peer.link_id();
+        let transport_id = peer.transport_id();
 
-        // Free session index
-        if let (Some(tid), Some(idx)) = (peer.transport_id(), peer.our_index()) {
-            self.peers_by_index.remove(&(tid, idx.as_u32()));
-            let _ = self.index_allocator.free(idx);
+        // Free session indices (current, rekey, pending, previous)
+        if let Some(tid) = transport_id {
+            if let Some(idx) = peer.our_index() {
+                self.peers_by_index.remove(&(tid, idx.as_u32()));
+                let _ = self.index_allocator.free(idx);
+            }
+            if let Some(idx) = peer.rekey_our_index() {
+                self.pending_outbound.remove(&(tid, idx.as_u32()));
+                self.peers_by_index.remove(&(tid, idx.as_u32()));
+                let _ = self.index_allocator.free(idx);
+            }
+            if let Some(idx) = peer.pending_our_index() {
+                self.peers_by_index.remove(&(tid, idx.as_u32()));
+                let _ = self.index_allocator.free(idx);
+            }
+            if let Some(idx) = peer.previous_our_index() {
+                self.peers_by_index.remove(&(tid, idx.as_u32()));
+                let _ = self.index_allocator.free(idx);
+            }
         }
 
         // Remove link and address mapping

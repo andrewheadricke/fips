@@ -145,6 +145,10 @@ jobs:
           - suite: static-chain
             type: static
             topology: chain
+          # ── Rekey integration test ──────────────────────────────────────────
+          - suite: rekey
+            type: rekey
+            topology: rekey
           # ── Chaos / stochastic scenarios ───────────────────────────────────
           - suite: chaos-smoke-10
             type: chaos
@@ -232,6 +236,48 @@ jobs:
         run: |
           docker compose -f testing/static/docker-compose.yml \
             --profile ${{ matrix.topology }} down --volumes --remove-orphans
+
+      # ── Rekey integration test ──────────────────────────────────────────────
+      - name: Install binary (rekey)
+        if: matrix.type == 'rekey'
+        run: |
+          chmod +x _bin/fips _bin/fipsctl
+          cp _bin/fips    testing/static/fips
+          cp _bin/fipsctl testing/static/fipsctl
+
+      - name: Generate and inject configs (rekey)
+        if: matrix.type == 'rekey'
+        run: |
+          bash testing/static/scripts/generate-configs.sh rekey
+          bash testing/static/scripts/rekey-test.sh inject-config
+
+      - name: Build Docker images (rekey)
+        if: matrix.type == 'rekey'
+        run: |
+          docker compose -f testing/static/docker-compose.yml \
+            --profile rekey build
+
+      - name: Start containers (rekey)
+        if: matrix.type == 'rekey'
+        run: |
+          docker compose -f testing/static/docker-compose.yml \
+            --profile rekey up -d
+
+      - name: Run rekey test
+        if: matrix.type == 'rekey'
+        run: bash testing/static/scripts/rekey-test.sh
+
+      - name: Collect logs on failure (rekey)
+        if: matrix.type == 'rekey' && failure()
+        run: |
+          docker compose -f testing/static/docker-compose.yml \
+            --profile rekey logs --no-color
+
+      - name: Stop containers (rekey)
+        if: matrix.type == 'rekey' && always()
+        run: |
+          docker compose -f testing/static/docker-compose.yml \
+            --profile rekey down --volumes --remove-orphans
 
       # ── Chaos simulation ───────────────────────────────────────────────────
       - name: Install Python deps (chaos)

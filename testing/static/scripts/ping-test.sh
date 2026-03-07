@@ -52,8 +52,8 @@ echo "=== FIPS Ping Test ($PROFILE topology) ==="
 echo ""
 
 # Wait for nodes to converge
-echo "Waiting 3s for mesh convergence..."
-sleep 3
+echo "Waiting 5s for mesh convergence..."
+sleep 5
 
 if [ "$PROFILE" = "mesh" ] || [ "$PROFILE" = "mesh-public" ]; then
     # Sparse mesh topology: A-B, B-C, C-D, D-E, E-A, A-D

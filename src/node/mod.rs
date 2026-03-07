@@ -35,7 +35,7 @@ use crate::transport::ethernet::EthernetTransport;
 use crate::tree::TreeState;
 use crate::upper::icmp_rate_limit::IcmpRateLimiter;
 use crate::upper::tun::{TunError, TunOutboundRx, TunState, TunTx};
-use self::wire::{build_encrypted, build_established_header, prepend_inner_header, FLAG_CE, FLAG_SP};
+use self::wire::{build_encrypted, build_established_header, prepend_inner_header, FLAG_CE, FLAG_KEY_EPOCH, FLAG_SP};
 use crate::{Config, ConfigError, Identity, IdentityError, NodeAddr, PeerIdentity};
 use rand::Rng;
 use std::collections::{HashMap, VecDeque};
@@ -1349,6 +1349,9 @@ impl Node {
         let mut flags = if sp_flag { FLAG_SP } else { 0 };
         if ce_flag {
             flags |= FLAG_CE;
+        }
+        if peer.current_k_bit() {
+            flags |= FLAG_KEY_EPOCH;
         }
 
         let session = peer.noise_session_mut().ok_or_else(|| NodeError::SendFailed {

@@ -96,13 +96,22 @@ impl Node {
                     return;
                 }
             } else {
-                // Outbound link to this address — cross-connection, allow msg1
-                debug!(
-                    transport_id = %packet.transport_id,
-                    remote_addr = %packet.remote_addr,
-                    existing_link_id = %existing_link_id,
-                    "Cross-connection detected: have outbound, received inbound msg1"
-                );
+                // Outbound link to this address. If it belongs to an active
+                // peer, this may be a rekey msg1 (same epoch) or a
+                // restart (different epoch). Set possible_restart to enable
+                // the epoch/rekey check below.
+                let is_active_peer = self.peers.values()
+                    .any(|p| p.link_id() == existing_link_id);
+                if is_active_peer {
+                    possible_restart = true;
+                } else {
+                    debug!(
+                        transport_id = %packet.transport_id,
+                        remote_addr = %packet.remote_addr,
+                        existing_link_id = %existing_link_id,
+                        "Cross-connection detected: have outbound, received inbound msg1"
+                    );
+                }
             }
         }
 
@@ -141,6 +150,13 @@ impl Node {
 
         let peer_node_addr = *peer_identity.node_addr();
 
+        // Identity-based restart/rekey detection: if the peer is already
+        // active but addr_to_link didn't match (different source address, e.g.,
+        // TCP from a different port), we still need to check for restart/rekey.
+        if !possible_restart && self.peers.contains_key(&peer_node_addr) {
+            possible_restart = true;
+        }
+
         // Epoch-based restart detection and duplicate msg1 handling.
         //
         // If we fell through from the addr_to_link check above with
@@ -163,8 +179,96 @@ impl Node {
                     // Fall through to process as new connection
                 }
                 _ => {
-                    // Same epoch (or no epoch stored) — duplicate msg1 from
-                    // same session. Resend stored msg2.
+                    // Same epoch (or no epoch stored).
+                    // If the peer has an active session and rekey is enabled,
+                    // this is a rekey msg1 (not a duplicate initial msg1).
+                    // Guard: the session must be at least 30s old to avoid
+                    // misidentifying a cross-connection msg1 as a rekey.
+                    // During simultaneous connection, both sides promote
+                    // within the same tick and the peer's msg1 arrives
+                    // immediately — a genuine rekey can't fire that fast.
+                    let session_age_secs = existing_peer
+                        .session_established_at()
+                        .elapsed()
+                        .as_secs();
+                    if self.config.node.rekey.enabled
+                        && existing_peer.has_session()
+                        && existing_peer.is_healthy()
+                        && session_age_secs >= 30
+                    {
+                        // Rekey: process as responder, store new session as pending
+                        let noise_session = conn.take_session();
+                        let our_new_index = match self.index_allocator.allocate() {
+                            Ok(idx) => idx,
+                            Err(e) => {
+                                warn!(error = %e, "Failed to allocate index for rekey");
+                                self.msg1_rate_limiter.complete_handshake();
+                                return;
+                            }
+                        };
+
+                        let noise_session = match noise_session {
+                            Some(s) => s,
+                            None => {
+                                warn!("Rekey msg1: no session from handshake");
+                                let _ = self.index_allocator.free(our_new_index);
+                                self.msg1_rate_limiter.complete_handshake();
+                                return;
+                            }
+                        };
+
+                        // Send msg2 response using the new handshake
+                        let wire_msg2 = build_msg2(our_new_index, header.sender_idx, &msg2_response);
+                        if let Some(transport) = self.transports.get(&packet.transport_id) {
+                            match transport.send(&packet.remote_addr, &wire_msg2).await {
+                                Ok(_) => {
+                                    debug!(
+                                        peer = %self.peer_display_name(&peer_node_addr),
+                                        new_our_index = %our_new_index,
+                                        "Sent rekey msg2 response"
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        peer = %self.peer_display_name(&peer_node_addr),
+                                        error = %e,
+                                        "Failed to send rekey msg2"
+                                    );
+                                    let _ = self.index_allocator.free(our_new_index);
+                                    self.msg1_rate_limiter.complete_handshake();
+                                    return;
+                                }
+                            }
+                        }
+
+                        // Store pending session on the existing peer
+                        if let Some(peer) = self.peers.get_mut(&peer_node_addr) {
+                            peer.set_pending_session(
+                                noise_session,
+                                our_new_index,
+                                header.sender_idx,
+                            );
+                            peer.record_peer_rekey();
+                        }
+
+                        // Register new index in peers_by_index
+                        self.peers_by_index.insert(
+                            (packet.transport_id, our_new_index.as_u32()),
+                            peer_node_addr,
+                        );
+
+                        // Clean up: remove the temporary connection/link we created.
+                        // Do NOT remove addr_to_link — the entry must remain pointing
+                        // to the original link so future msg1s from this address are
+                        // recognized as rekeys (not new connections).
+                        self.connections.remove(&link_id);
+                        self.links.remove(&link_id);
+
+                        self.msg1_rate_limiter.complete_handshake();
+                        return;
+                    }
+
+                    // Not a rekey — duplicate msg1. Resend stored msg2.
                     if let Some(msg2) = existing_peer.handshake_msg2().map(|m| m.to_vec())
                         && let Some(transport) = self.transports.get(&packet.transport_id)
                     {
@@ -384,14 +488,71 @@ impl Node {
             }
         };
 
-        let conn = match self.connections.get_mut(&link_id) {
-            Some(c) => c,
-            None => {
-                // Connection removed, clean up pending_outbound
+        // Check if this is a rekey msg2: the handshake state is on the
+        // ActivePeer (not a PeerConnection), so self.connections won't have it.
+        // Look for a peer with matching rekey_our_index.
+        if !self.connections.contains_key(&link_id) {
+            let noise_msg2 = &packet.data[header.noise_msg2_offset..];
+
+            // Find peer with rekey in progress for this index
+            let peer_addr = self.peers.iter().find_map(|(addr, peer)| {
+                if peer.rekey_in_progress()
+                    && peer.rekey_our_index() == Some(header.receiver_idx)
+                {
+                    Some(*addr)
+                } else {
+                    None
+                }
+            });
+
+            if let Some(peer_node_addr) = peer_addr {
+                let display_name = self.peer_display_name(&peer_node_addr);
+
+                // Complete the rekey handshake on the ActivePeer
+                if let Some(peer) = self.peers.get_mut(&peer_node_addr) {
+                    match peer.complete_rekey_msg2(noise_msg2) {
+                        Ok(session) => {
+                            let our_index = peer.rekey_our_index()
+                                .unwrap_or(header.receiver_idx);
+                            peer.set_pending_session(session, our_index, header.sender_idx);
+
+                            if let Some(transport_id) = peer.transport_id() {
+                                self.peers_by_index.insert(
+                                    (transport_id, our_index.as_u32()),
+                                    peer_node_addr,
+                                );
+                            }
+
+                            debug!(
+                                peer = %display_name,
+                                new_our_index = %our_index,
+                                new_their_index = %header.sender_idx,
+                                "Rekey completed (initiator), pending K-bit cutover"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                peer = %display_name,
+                                error = %e,
+                                "Rekey msg2 processing failed"
+                            );
+                            if let Some(idx) = peer.abandon_rekey() {
+                                let _ = self.index_allocator.free(idx);
+                            }
+                        }
+                    }
+                }
+
                 self.pending_outbound.remove(&key);
                 return;
             }
-        };
+
+            // Not a rekey — stale pending_outbound entry
+            self.pending_outbound.remove(&key);
+            return;
+        }
+
+        let conn = self.connections.get_mut(&link_id).unwrap();
 
         // Process Noise msg2
         let noise_msg2 = &packet.data[header.noise_msg2_offset..];

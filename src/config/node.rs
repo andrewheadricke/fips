@@ -418,6 +418,42 @@ impl BuffersConfig {
 // ECN Congestion Signaling
 // ============================================================================
 
+/// Rekey / session rekeying configuration (`node.rekey.*`).
+///
+/// Controls periodic full rekey for both FMP (link layer) and FSP
+/// (session layer) Noise sessions. Rekeying provides true forward secrecy
+/// with fresh DH randomness, nonce reset, and session index rotation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RekeyConfig {
+    /// Enable periodic rekey (`node.rekey.enabled`).
+    #[serde(default = "RekeyConfig::default_enabled")]
+    pub enabled: bool,
+
+    /// Initiate rekey after this many seconds (`node.rekey.after_secs`).
+    #[serde(default = "RekeyConfig::default_after_secs")]
+    pub after_secs: u64,
+
+    /// Initiate rekey after this many messages sent (`node.rekey.after_messages`).
+    #[serde(default = "RekeyConfig::default_after_messages")]
+    pub after_messages: u64,
+}
+
+impl Default for RekeyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            after_secs: 120,
+            after_messages: 1 << 16, // 65536
+        }
+    }
+}
+
+impl RekeyConfig {
+    fn default_enabled() -> bool { true }
+    fn default_after_secs() -> u64 { 120 }
+    fn default_after_messages() -> u64 { 1 << 16 }
+}
+
 /// ECN congestion signaling configuration (`node.ecn.*`).
 ///
 /// Controls the FMP CE relay chain: transit nodes detect congestion on outgoing
@@ -541,6 +577,10 @@ pub struct NodeConfig {
     /// ECN congestion signaling (`node.ecn.*`).
     #[serde(default)]
     pub ecn: EcnConfig,
+
+    /// Rekey / session rekeying (`node.rekey.*`).
+    #[serde(default)]
+    pub rekey: RekeyConfig,
 }
 
 impl Default for NodeConfig {
@@ -565,6 +605,7 @@ impl Default for NodeConfig {
             mmp: MmpConfig::default(),
             session_mmp: SessionMmpConfig::default(),
             ecn: EcnConfig::default(),
+            rekey: RekeyConfig::default(),
         }
     }
 }
