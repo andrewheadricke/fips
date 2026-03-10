@@ -116,8 +116,14 @@ echo "tmpfiles.d entry created for /run/fips/ ownership."
 # --- Enable service ---
 
 systemctl enable fips.service
-systemctl enable fips-dns.service
-echo "Services enabled (will start on boot)."
+if systemctl is-active --quiet systemd-resolved.service 2>/dev/null; then
+    systemctl enable fips-dns.service
+    echo "Services enabled (will start on boot)."
+else
+    echo "fips.service enabled (will start on boot)."
+    echo "  Note: fips-dns.service not enabled (systemd-resolved is not running)."
+    echo "  To enable .fips DNS later: sudo systemctl enable --now fips-dns.service"
+fi
 
 # Restart if they were running before
 if $was_active; then

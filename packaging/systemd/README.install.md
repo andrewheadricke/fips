@@ -76,18 +76,25 @@ peers:
     connect_policy: auto_connect
 ```
 
-### 4. DNS Resolver
+### 4. DNS Resolver (optional, requires systemd-resolved)
 
 FIPS includes a DNS responder for `.fips` domain names (port 5354).
-To integrate with systemd-resolved:
+On systems running `systemd-resolved`, the installer automatically enables
+`fips-dns.service` to route `.fips` queries to the FIPS resolver.
+
+If `systemd-resolved` is not running at install time, DNS integration is
+skipped. To enable it later (after starting `systemd-resolved`):
+
+```bash
+sudo systemctl enable --now fips-dns.service
+```
+
+For manual configuration without `fips-dns.service`:
 
 ```bash
 sudo resolvectl dns fips0 127.0.0.1:5354
 sudo resolvectl domain fips0 ~fips
 ```
-
-To make this persistent, create a systemd-networkd override or add a
-drop-in for the fips0 interface.
 
 ## Firewall Ports
 

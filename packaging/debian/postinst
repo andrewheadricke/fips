@@ -18,12 +18,16 @@ case "$1" in
         if [ -d /run/systemd/system ]; then
             systemctl daemon-reload
             systemctl enable fips.service 2>/dev/null || true
-            systemctl enable fips-dns.service 2>/dev/null || true
+            if systemctl is-active --quiet systemd-resolved.service 2>/dev/null; then
+                systemctl enable fips-dns.service 2>/dev/null || true
+            fi
 
             # On upgrade, restart services that were running before
             if [ -n "$2" ]; then
                 systemctl start fips.service 2>/dev/null || true
-                systemctl start fips-dns.service 2>/dev/null || true
+                if systemctl is-enabled --quiet fips-dns.service 2>/dev/null; then
+                    systemctl start fips-dns.service 2>/dev/null || true
+                fi
             fi
         fi
         ;;
