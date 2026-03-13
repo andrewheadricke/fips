@@ -1,5 +1,5 @@
 # FIPS: Free Internetworking Peering System
-
+![banner](docs/logos/fips_banner.png)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
 [![Status](https://img.shields.io/badge/status-alpha%20(0.1.0)-yellow.svg)](#status--roadmap)
