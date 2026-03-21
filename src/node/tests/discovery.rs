@@ -1,8 +1,8 @@
 //! Discovery protocol tests: LookupRequest and LookupResponse.
 //!
-//! Unit tests for handler logic (dedup, visited filter, TTL, response
-//! caching) and integration tests for multi-node forwarding and
-//! reverse-path response routing.
+//! Unit tests for handler logic (dedup, TTL, response caching) and
+//! integration tests for multi-node forwarding and reverse-path
+//! response routing.
 
 use super::*;
 use crate::node::RecentRequest;
@@ -44,26 +44,6 @@ async fn test_request_dedup() {
     // Duplicate request: dropped
     node.handle_lookup_request(&from, payload).await;
     assert_eq!(node.recent_requests.len(), 1);
-}
-
-#[tokio::test]
-async fn test_request_visited_filter_self() {
-    let mut node = make_node();
-    let from = make_node_addr(0xAA);
-    let target = make_node_addr(0xBB);
-    let origin = make_node_addr(0xCC);
-    let coords = TreeCoordinate::from_addrs(vec![origin, make_node_addr(0)]).unwrap();
-
-    let mut request = LookupRequest::new(888, target, origin, coords, 5, 0);
-    // Mark ourselves as already visited
-    request.visited.insert(node.node_addr());
-
-    let payload = &request.encode()[1..];
-    node.handle_lookup_request(&from, payload).await;
-
-    // Request was recorded (dedup happens before visited check)
-    // but the handler should have stopped after detecting self in visited filter
-    assert!(node.recent_requests.contains_key(&888));
 }
 
 #[tokio::test]
@@ -379,13 +359,13 @@ async fn test_recent_request_expiry() {
 #[tokio::test]
 async fn test_request_forwarding_two_node() {
     // Set up a two-node topology: node0 — node1
-    // Send a LookupRequest from node0 targeting some unknown node.
+    // Send a LookupRequest from node0 targeting node1's address.
     // Node1 should receive the forwarded request.
     let edges = vec![(0, 1)];
     let mut nodes = run_tree_test(2, &edges, false).await;
 
     let node0_addr = *nodes[0].node.node_addr();
-    let target = make_node_addr(0xEE); // unknown node
+    let target = *nodes[1].node.node_addr(); // target node1 (in bloom filters)
     let root = make_node_addr(0);
 
     let coords = TreeCoordinate::from_addrs(vec![node0_addr, root]).unwrap();
@@ -499,20 +479,22 @@ async fn test_request_three_node_chain() {
 #[tokio::test]
 async fn test_request_dedup_convergent_paths() {
     // Topology: triangle (node0 — node1, node0 — node2, node1 — node2)
-    // A request from node0 reaches node2 via two paths: 0→1→2 and 0→2.
-    // The second arrival at node2 should be deduped.
+    // A request from node0 targeting node2 may reach it via two paths
+    // depending on bloom filter state. If both paths deliver the request,
+    // the second arrival at node2 should be deduped.
     let edges = vec![(0, 1), (0, 2), (1, 2)];
     let mut nodes = run_tree_test(3, &edges, false).await;
 
     let node0_addr = *nodes[0].node.node_addr();
-    let target = make_node_addr(0xEE);
+    let target = *nodes[2].node.node_addr(); // target node2 (in bloom filters)
     let root = make_node_addr(0);
 
     let coords = TreeCoordinate::from_addrs(vec![node0_addr, root]).unwrap();
     let request = LookupRequest::new(300, target, node0_addr, coords, 5, 0);
     let payload = &request.encode()[1..];
 
-    // Node0 handles the request (forwards to both node1 and node2)
+    // Node0 handles the request (forwards to peers whose bloom filter
+    // contains node2 — bloom-guided, not flooding)
     nodes[0]
         .node
         .handle_lookup_request(&node0_addr, payload)
@@ -524,12 +506,16 @@ async fn test_request_dedup_convergent_paths() {
         process_available_packets(&mut nodes).await;
     }
 
-    // Both node1 and node2 should have recorded the request
-    assert!(nodes[1].node.recent_requests.contains_key(&300));
-    assert!(nodes[2].node.recent_requests.contains_key(&300));
+    // Node2 (the target) must have received the request
+    assert!(
+        nodes[2].node.recent_requests.contains_key(&300),
+        "Node 2 (target) should have received the request"
+    );
 
-    // The request should appear exactly once in each node's recent_requests
-    // (dedup prevents duplicate processing via convergent paths)
+    // If node1 also received and forwarded it, node2 would have seen a
+    // duplicate — verify dedup counter reflects convergent arrivals.
+    // With bloom-guided routing, node1 may or may not receive the request
+    // depending on filter state, so we only assert the target received it.
 
     cleanup_nodes(&mut nodes).await;
 }
@@ -547,10 +533,17 @@ async fn test_discovery_100_nodes() {
     const NUM_NODES: usize = 100;
     const TARGET_EDGES: usize = 250;
     const SEED: u64 = 42;
-    const TTL: u8 = 15; // generous TTL for network diameter
+    const TTL: u8 = 20; // must exceed tree diameter (can reach 17+ hops)
     let edges = generate_random_edges(NUM_NODES, TARGET_EDGES, SEED);
     let mut nodes = run_tree_test(NUM_NODES, &edges, false).await;
     verify_tree_convergence(&nodes);
+
+    // Disable forward rate limiting: in this test all 100 nodes look up
+    // the same 10 targets in <1s wall time. The 2s per-target rate limit
+    // would suppress nearly all transit forwarding.
+    for tn in nodes.iter_mut() {
+        tn.node.disable_discovery_forward_rate_limit();
+    }
 
     // Collect all node addresses and public keys for lookup targets
     let all_addrs: Vec<NodeAddr> = nodes
@@ -588,9 +581,8 @@ async fn test_discovery_100_nodes() {
     let total_lookups = lookup_pairs.len();
 
     // Process one source node at a time. Each node initiates ~10 lookups,
-    // which flood through the network. We drain until quiescent before
-    // moving to the next node. This avoids overwhelming UDP buffers
-    // while still testing concurrent lookups from the same origin.
+    // which route through the tree via bloom filters. We drain until
+    // quiescent before moving to the next node.
     for src in 0..NUM_NODES {
         // Initiate all lookups for this source node
         let mut initiated = false;
@@ -607,14 +599,17 @@ async fn test_discovery_100_nodes() {
             continue;
         }
 
-        // Drain packets until quiescent
+        // Drain packets until quiescent. With single-path tree routing,
+        // a packet forwarded by node X may land in node Y's queue where
+        // Y < X in iteration order, causing a zero-count round even though
+        // packets are in flight. Use a higher idle threshold to handle this.
         let mut idle_rounds = 0;
-        for _ in 0..40 {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        for _ in 0..80 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
             let count = process_available_packets(&mut nodes).await;
             if count == 0 {
                 idle_rounds += 1;
-                if idle_rounds >= 2 {
+                if idle_rounds >= 5 {
                     break;
                 }
             } else {

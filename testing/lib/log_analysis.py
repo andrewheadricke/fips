@@ -55,6 +55,7 @@ class AnalysisResult:
     discovery_timeout: list[tuple[str, str]] = field(default_factory=list)
     discovery_retry: list[tuple[str, str]] = field(default_factory=list)
     discovery_no_tree_peer: list[tuple[str, str]] = field(default_factory=list)
+    discovery_fallback: list[tuple[str, str]] = field(default_factory=list)
     discovery_trigger: list[tuple[str, str]] = field(default_factory=list)
 
     def summary(self) -> str:
@@ -85,6 +86,7 @@ class AnalysisResult:
             f"Backoff suppressed:    {len(self.discovery_backoff)}",
             f"Deduplicated:          {len(self.discovery_dedup)}",
             f"No tree peer:          {len(self.discovery_no_tree_peer)}",
+            f"Non-tree fallback:     {len(self.discovery_fallback)}",
             f"Timed out:             {len(self.discovery_timeout)}",
         ]
 
@@ -172,7 +174,7 @@ def _analyze_lines(result: AnalysisResult, source: str, log_text: str):
         if "Rekey cutover complete" in line or "FSP rekey cutover complete" in line:
             result.rekey_cutovers.append((source, line))
         # Discovery
-        if "Initiating LookupRequest" in line:
+        if "Initiating LookupRequest" in line or "Discovery lookup initiated" in line:
             result.discovery_initiated.append((source, line))
         if "proof verified, caching route" in line:
             result.discovery_succeeded.append((source, line))
@@ -186,8 +188,10 @@ def _analyze_lines(result: AnalysisResult, source: str, log_text: str):
             result.discovery_timeout.append((source, line))
         if "Discovery retry sent" in line:
             result.discovery_retry.append((source, line))
-        if "no tree peers with bloom match" in line:
+        if "no tree peers with bloom match" in line or "No eligible peers to forward" in line:
             result.discovery_no_tree_peer.append((source, line))
+        if "non-tree fallback" in line:
+            result.discovery_fallback.append((source, line))
         if "Failed to initiate session, trying discovery" in line:
             result.discovery_trigger.append((source, line))
 
