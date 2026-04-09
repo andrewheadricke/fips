@@ -45,10 +45,12 @@ package() {
     install -Dm0755 target/release/fips "$pkgdir/usr/bin/fips"
     install -Dm0755 target/release/fipsctl "$pkgdir/usr/bin/fipsctl"
     install -Dm0755 target/release/fipstop "$pkgdir/usr/bin/fipstop"
+    install -Dm0755 target/release/fips-gateway "$pkgdir/usr/bin/fips-gateway"
 
     # Systemd service files (from packaging/debian/ -- correct /usr/bin/ paths)
     install -Dm0644 packaging/debian/fips.service "$pkgdir/usr/lib/systemd/system/fips.service"
     install -Dm0644 packaging/debian/fips-dns.service "$pkgdir/usr/lib/systemd/system/fips-dns.service"
+    install -Dm0644 packaging/debian/fips-gateway.service "$pkgdir/usr/lib/systemd/system/fips-gateway.service"
 
     # Config files (from packaging/common/)
     install -Dm0600 packaging/common/fips.yaml "$pkgdir/etc/fips/fips.yaml"

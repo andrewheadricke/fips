@@ -26,7 +26,7 @@ tarball:
 	@bash $(PACKAGING_DIR)/systemd/build-tarball.sh
 
 ipk:
-	@bash $(PACKAGING_DIR)/openwrt/build-ipk.sh
+	@bash $(PACKAGING_DIR)/openwrt-ipk/build-ipk.sh
 
 aur:
 	@bash $(PACKAGING_DIR)/aur/build-aur.sh
