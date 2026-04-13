@@ -92,6 +92,8 @@ enum ShowCommands {
     Transports,
     /// Routing table summary
     Routing,
+    /// Identity cache entries (known node pubkeys)
+    IdentityCache,
 }
 
 impl ShowCommands {
@@ -108,6 +110,7 @@ impl ShowCommands {
             ShowCommands::Connections => "show_connections",
             ShowCommands::Transports => "show_transports",
             ShowCommands::Routing => "show_routing",
+            ShowCommands::IdentityCache => "show_identity_cache",
         }
     }
 }
