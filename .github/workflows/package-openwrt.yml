@@ -79,14 +79,15 @@ jobs:
             rust_channel: stable
             # MT3000, MT6000, Flint 2, RPi 3/4/5
           # MIPS disabled: 32-bit MIPS lacks AtomicU64; needs portable-atomic crate
-          # - build_arch: mipsel
-          #   openwrt_arch: mipsel_24kc
-          #   rust_target: mipsel-unknown-linux-musl
-          #   rust_channel: nightly
-          # - build_arch: mips
-          #   openwrt_arch: mips_24kc
-          #   rust_target: mips-unknown-linux-musl
-          #   rust_channel: nightly
+          - build_arch: mipsel
+            openwrt_arch: mipsel_24kc
+            rust_target: mipsel-unknown-linux-musl
+            rust_channel: nightly
+          - build_arch: mips
+            openwrt_arch: mips_24kc
+            rust_target: mips-unknown-linux-musl
+            rust_channel: nightly
+            # ar300m16
           - build_arch: x86_64
             openwrt_arch: x86_64
             rust_target: x86_64-unknown-linux-musl
